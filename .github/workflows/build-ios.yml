@@ -12,7 +12,7 @@ permissions:
 jobs:
   build-ios:
     name: Build Pomme iOS
-    runs-on: macos-15
+    runs-on: macos-15-intel
     timeout-minutes: 120
 
     steps:
