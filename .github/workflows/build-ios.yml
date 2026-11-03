@@ -1,4 +1,4 @@
-```yaml
+
 name: Pomme-iOS
 
 on:
@@ -74,4 +74,3 @@ jobs:
           path: Pomme-unsigned.ipa
           if-no-files-found: error
           retention-days: 7
-```
