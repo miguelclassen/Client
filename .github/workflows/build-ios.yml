@@ -1,4 +1,3 @@
-
 name: Pomme-iOS
 
 on:
@@ -34,6 +33,14 @@ jobs:
         with:
           targets: aarch64-apple-ios,aarch64-apple-ios-sim
 
+      - name: Ensure Rust targets
+        run: |
+          rustup target add aarch64-apple-ios
+          rustup target add aarch64-apple-ios-sim
+          rustup target list --installed
+          rustc --version
+          cargo --version
+
       - name: Generate Xcode project
         run: |
           xcodegen generate --spec pomme-ios/project.yml
@@ -52,13 +59,17 @@ jobs:
             CODE_SIGN_IDENTITY="" \
             build
 
+      - name: Locate app bundle
+        run: |
+          find target/ios-build -name "*.app" -type d
+
       - name: Package unsigned IPA
         run: |
           APP="target/ios-build/Build/Products/Release-iphoneos/Pomme.app"
 
           if [ ! -d "$APP" ]; then
-            echo "ERROR: Pomme.app not found"
-            find target/ios-build -name "*.app"
+            echo "ERROR: Pomme.app not found!"
+            find target/ios-build -name "*.app" -type d
             exit 1
           fi
 
