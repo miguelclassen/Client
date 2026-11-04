@@ -1,9 +1,11 @@
+
 name: Pomme-iOS
 
 on:
   workflow_dispatch:
   push:
     branches:
+      - master
       - main
 
 permissions:
@@ -11,17 +13,16 @@ permissions:
 
 jobs:
   build-ios:
-    name: Build Pomme iOS
+    name: Build unsigned iOS IPA
     runs-on: macos-15-intel
     timeout-minutes: 240
 
     env:
       RUSTUP_TOOLCHAIN: nightly-2026-08-21
       RUST_BACKTRACE: full
-      CARGO_PROFILE_RELEASE_BUILD_OVERRIDE_DEBUG: "true"
 
     steps:
-      # 1. Download source
+      # 1. Repository herunterladen
       - name: Checkout Pomme
         uses: actions/checkout@v4
         with:
@@ -30,15 +31,17 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
-      # 2. Install dependencies
+      # 2. Build-Abhängigkeiten installieren
       - name: Install dependencies
         run: |
+          set -euo pipefail
           brew install xcodegen cmake ninja
-          python3 --version
-          cmake --version
-          xcodebuild -version
 
-      # 3. Install Vulkan SDK
+          xcodebuild -version
+          cmake --version
+          python3 --version
+
+      # 3. Vulkan SDK installieren
       - name: Install Vulkan SDK
         shell: bash
         run: |
@@ -56,21 +59,21 @@ jobs:
 
           unzip -q "$DOWNLOAD/vulkan.zip" -d "$DOWNLOAD"
 
-          APP=$(find "$DOWNLOAD" \
+          APP="$(find "$DOWNLOAD" \
             -maxdepth 4 -type d -name "*.app" \
-            -print -quit)
+            -print -quit)"
 
           if [ -z "$APP" ]; then
-            echo "ERROR: Vulkan installer app missing"
+            echo "ERROR: Vulkan installer app not found"
             exit 1
           fi
 
-          INSTALLER=$(find "$APP/Contents/MacOS" \
+          INSTALLER="$(find "$APP/Contents/MacOS" \
             -maxdepth 1 -type f -perm -111 \
-            -print -quit)
+            -print -quit)"
 
           if [ -z "$INSTALLER" ]; then
-            echo "ERROR: Vulkan installer executable missing"
+            echo "ERROR: Vulkan installer executable not found"
             exit 1
           fi
 
@@ -85,25 +88,16 @@ jobs:
 
           VULKAN_SDK="$SDK_ROOT/macOS"
 
-          if [ ! -f "$VULKAN_SDK/share/vulkan/registry/vk.xml" ]; then
-            echo "ERROR: vk.xml missing"
-            find "$SDK_ROOT" -name vk.xml
-            exit 1
-          fi
-
-          if ! find "$VULKAN_SDK/lib" -maxdepth 1 \
-            -type f -name "libshaderc*" | grep -q .; then
-            echo "ERROR: shaderc library missing"
-            ls -la "$VULKAN_SDK/lib"
-            exit 1
-          fi
+          test -f "$VULKAN_SDK/share/vulkan/registry/vk.xml"
+          test -f "$VULKAN_SDK/lib/libshaderc_combined.a"
 
           echo "VULKAN_SDK=$VULKAN_SDK" >> "$GITHUB_ENV"
           echo "$VULKAN_SDK/bin" >> "$GITHUB_PATH"
 
-          echo "Vulkan SDK installed successfully"
+          echo "Vulkan SDK installed:"
+          echo "$VULKAN_SDK"
 
-      # 4. Install exact Rust toolchain
+      # 4. Rust installieren
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:
@@ -111,8 +105,45 @@ jobs:
           components: rust-src
           targets: aarch64-apple-ios,aarch64-apple-ios-sim
 
-      # 5. Verify environment
-      - name: Verify environment
+      # 5. Statisches shaderc-Linking aktivieren
+      - name: Configure static shaderc linking
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          MANIFEST="pomme-client/Cargo.toml"
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("pomme-client/Cargo.toml")
+          content = path.read_text()
+
+          old = 'shaderc = "0.10"'
+          new = 'shaderc = { version = "0.10", features = ["prefer-static-linking"] }'
+
+          if new in content:
+              print("Static shaderc linking is already enabled")
+          elif content.count(old) == 1:
+              path.write_text(content.replace(old, new))
+              print("Enabled prefer-static-linking")
+          else:
+              raise SystemExit(
+                  "ERROR: Could not safely locate shaderc dependency in Cargo.toml"
+              )
+          PY
+
+          grep -n "shaderc" "$MANIFEST"
+
+          test -f "$VULKAN_SDK/lib/libshaderc_combined.a"
+
+          lipo -verify_arch x86_64 \
+            "$VULKAN_SDK/lib/libshaderc_combined.a"
+
+          echo "Static shaderc library verified"
+
+      # 6. Rust- und Vulkan-Umgebung überprüfen
+      - name: Verify build environment
         shell: bash
         run: |
           set -euo pipefail
@@ -123,14 +154,11 @@ jobs:
           rustup target list --installed
 
           test -f "$VULKAN_SDK/share/vulkan/registry/vk.xml"
-          test -d "$VULKAN_SDK/lib"
+          test -f "$VULKAN_SDK/lib/libshaderc_combined.a"
 
-          echo "VULKAN_SDK=$VULKAN_SDK"
+          echo "Build environment OK"
 
-          rustc --print target-libdir \
-            --target aarch64-apple-ios
-
-      # 6. Generate Xcode project
+      # 7. Xcode-Projekt generieren
       - name: Generate Xcode project
         working-directory: pomme-ios
         run: |
@@ -142,7 +170,7 @@ jobs:
 
           xcodebuild -list -project Pomme.xcodeproj
 
-      # 7. Build unsigned iOS application
+      # 8. iOS-App bauen
       - name: Build Pomme iOS
         shell: bash
         run: |
@@ -151,7 +179,7 @@ jobs:
           export VULKAN_SDK
           export PATH="$HOME/.cargo/bin:$VULKAN_SDK/bin:$PATH"
 
-          echo "Using Vulkan SDK: $VULKAN_SDK"
+          echo "Building Pomme for iOS..."
 
           xcodebuild \
             -project pomme-ios/Pomme.xcodeproj \
@@ -165,7 +193,7 @@ jobs:
             CODE_SIGN_IDENTITY="" \
             build 2>&1 | tee ios-build.log
 
-      # 8. Verify app
+      # 9. App überprüfen
       - name: Verify Pomme.app
         shell: bash
         run: |
@@ -174,7 +202,7 @@ jobs:
           APP="target/ios-build/Build/Products/Release-iphoneos/Pomme.app"
 
           if [ ! -d "$APP" ]; then
-            echo "ERROR: Pomme.app not found"
+            echo "ERROR: Pomme.app was not created"
             find target/ios-build -name "*.app" -type d
             exit 1
           fi
@@ -184,9 +212,9 @@ jobs:
 
           plutil -lint "$APP/Info.plist"
 
-          echo "Application verified"
+          echo "Pomme.app successfully verified"
 
-      # 9. Create IPA
+      # 10. Unsigned IPA erstellen
       - name: Package unsigned IPA
         shell: bash
         run: |
@@ -204,10 +232,10 @@ jobs:
           test -s Pomme-unsigned.ipa
           unzip -t Pomme-unsigned.ipa
 
-          echo "IPA successfully created"
+          echo "IPA successfully created:"
           ls -lh Pomme-unsigned.ipa
 
-      # 10. Upload IPA
+      # 11. IPA als GitHub Artifact hochladen
       - name: Upload Pomme-iOS
         uses: actions/upload-artifact@v4
         with:
@@ -216,7 +244,7 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      # 11. Upload logs on failure
+      # 12. Build-Logs bei Fehlern sichern
       - name: Upload build logs
         if: failure()
         uses: actions/upload-artifact@v4
