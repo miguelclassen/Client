@@ -31,10 +31,12 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
-      # 2. Build-Abhängigkeiten installieren
+      # 2. Abhängigkeiten installieren
       - name: Install dependencies
+        shell: bash
         run: |
           set -euo pipefail
+
           brew install xcodegen cmake ninja
 
           xcodebuild -version
@@ -60,7 +62,9 @@ jobs:
           unzip -q "$DOWNLOAD/vulkan.zip" -d "$DOWNLOAD"
 
           APP="$(find "$DOWNLOAD" \
-            -maxdepth 4 -type d -name "*.app" \
+            -maxdepth 4 \
+            -type d \
+            -name "*.app" \
             -print -quit)"
 
           if [ -z "$APP" ]; then
@@ -69,7 +73,9 @@ jobs:
           fi
 
           INSTALLER="$(find "$APP/Contents/MacOS" \
-            -maxdepth 1 -type f -perm -111 \
+            -maxdepth 1 \
+            -type f \
+            -perm -111 \
             -print -quit)"
 
           if [ -z "$INSTALLER" ]; then
@@ -88,14 +94,22 @@ jobs:
 
           VULKAN_SDK="$SDK_ROOT/macOS"
 
-          test -f "$VULKAN_SDK/share/vulkan/registry/vk.xml"
-          test -f "$VULKAN_SDK/lib/libshaderc_combined.a"
+          if [ ! -f "$VULKAN_SDK/share/vulkan/registry/vk.xml" ]; then
+            echo "ERROR: Vulkan vk.xml missing"
+            find "$SDK_ROOT" -name vk.xml
+            exit 1
+          fi
+
+          if [ ! -f "$VULKAN_SDK/lib/libshaderc_combined.a" ]; then
+            echo "ERROR: libshaderc_combined.a missing"
+            ls -la "$VULKAN_SDK/lib"
+            exit 1
+          fi
 
           echo "VULKAN_SDK=$VULKAN_SDK" >> "$GITHUB_ENV"
           echo "$VULKAN_SDK/bin" >> "$GITHUB_PATH"
 
-          echo "Vulkan SDK installed:"
-          echo "$VULKAN_SDK"
+          echo "Vulkan SDK installed successfully"
 
       # 4. Rust installieren
       - name: Install Rust
@@ -123,26 +137,28 @@ jobs:
           new = 'shaderc = { version = "0.10", features = ["prefer-static-linking"] }'
 
           if new in content:
-              print("Static shaderc linking is already enabled")
+              print("Static shaderc linking already enabled")
           elif content.count(old) == 1:
               path.write_text(content.replace(old, new))
               print("Enabled prefer-static-linking")
           else:
               raise SystemExit(
-                  "ERROR: Could not safely locate shaderc dependency in Cargo.toml"
+                  "ERROR: Could not safely locate shaderc dependency"
               )
           PY
 
           grep -n "shaderc" "$MANIFEST"
 
-          test -f "$VULKAN_SDK/lib/libshaderc_combined.a"
+          SHADERC_LIB="$VULKAN_SDK/lib/libshaderc_combined.a"
 
-          lipo -verify_arch x86_64 \
-            "$VULKAN_SDK/lib/libshaderc_combined.a"
+          test -f "$SHADERC_LIB"
+
+          # KORREKT: Datei steht vor -verify_arch
+          lipo "$SHADERC_LIB" -verify_arch x86_64
 
           echo "Static shaderc library verified"
 
-      # 6. Rust- und Vulkan-Umgebung überprüfen
+      # 6. Build-Umgebung überprüfen
       - name: Verify build environment
         shell: bash
         run: |
@@ -161,6 +177,7 @@ jobs:
       # 7. Xcode-Projekt generieren
       - name: Generate Xcode project
         working-directory: pomme-ios
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -235,7 +252,7 @@ jobs:
           echo "IPA successfully created:"
           ls -lh Pomme-unsigned.ipa
 
-      # 11. IPA als GitHub Artifact hochladen
+      # 11. IPA hochladen
       - name: Upload Pomme-iOS
         uses: actions/upload-artifact@v4
         with:
@@ -244,7 +261,7 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      # 12. Build-Logs bei Fehlern sichern
+      # 12. Logs bei Fehlern sichern
       - name: Upload build logs
         if: failure()
         uses: actions/upload-artifact@v4
