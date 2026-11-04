@@ -1,5 +1,5 @@
 
-name: Pomme-iOS
+name: Pomme iOS Build
 
 on:
   workflow_dispatch:
@@ -11,27 +11,63 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: pomme-ios-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-ios:
-    name: Build Pomme iOS IPA
+    name: Build unsigned iOS IPA
     runs-on: macos-15-intel
     timeout-minutes: 240
 
     env:
       RUSTUP_TOOLCHAIN: nightly-2026-08-21
       RUST_BACKTRACE: full
+      CARGO_TERM_COLOR: always
 
     steps:
-      # 1. Repository
-      - name: Checkout Pomme
-        uses: actions/checkout@v4
+      # 1. Check out the repository and its submodules
+      - name: Checkout repository
+        uses: actions/checkout@v7
         with:
-          repository: PommeMC/Client
-          ref: master
           submodules: recursive
           fetch-depth: 0
 
-      # 2. Dependencies
+      # 2. Fix stdout contamination in the MoltenVK download script.
+      # build-app.sh captures fetch_moltenvk.py stdout as VULKAN_SDK.
+      # Download messages must therefore go to stderr.
+      - name: Fix MoltenVK download output
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("tools/fetch_openal.py")
+          content = path.read_text()
+
+          old = 'print(f"downloading {url}")'
+          new = 'print(f"downloading {url}", file=sys.stderr)'
+
+          if new in content:
+              print("MoltenVK output fix already present")
+          elif content.count(old) == 1:
+              if "import sys" not in content:
+                  raise SystemExit("ERROR: fetch_openal.py does not import sys")
+
+              path.write_text(content.replace(old, new))
+              print("MoltenVK output fix applied")
+          else:
+              raise SystemExit(
+                  "ERROR: Could not safely patch tools/fetch_openal.py"
+              )
+          PY
+
+          grep -n "downloading" tools/fetch_openal.py
+
+      # 3. Install native build dependencies
       - name: Install dependencies
         shell: bash
         run: |
@@ -39,11 +75,19 @@ jobs:
 
           brew install xcodegen cmake
 
+          echo "Xcode:"
           xcodebuild -version
+
+          echo "CMake:"
           cmake --version
+
+          echo "Python:"
           python3 --version
 
-      # 3. Vulkan SDK for host-side shaderc
+          echo "Architecture:"
+          uname -m
+
+      # 4. Install the Vulkan SDK for host-side shaderc
       - name: Install Vulkan SDK
         shell: bash
         run: |
@@ -55,35 +99,52 @@ jobs:
 
           mkdir -p "$DOWNLOAD" "$SDK_ROOT"
 
-          curl -fL --retry 3 \
+          curl -fL --retry 5 --retry-all-errors \
             "https://sdk.lunarg.com/sdk/download/${VERSION}/mac/vulkansdk-macos-${VERSION}.zip" \
             -o "$DOWNLOAD/vulkan.zip"
 
           unzip -q "$DOWNLOAD/vulkan.zip" -d "$DOWNLOAD"
 
-          APP="$(find "$DOWNLOAD" \
-            -maxdepth 5 \
-            -type d \
-            -name "*.app" \
-            -print -quit)"
+          APP="$(python3 - "$DOWNLOAD" <<'PY'
+          import sys
+          from pathlib import Path
 
-          if [ -z "$APP" ]; then
-            echo "ERROR: Vulkan installer app not found"
-            find "$DOWNLOAD" -maxdepth 4 -print
-            exit 1
-          fi
+          root = Path(sys.argv[1])
+          apps = sorted(
+              p for p in root.iterdir()
+              if p.is_dir() and p.suffix == ".app"
+          )
 
-          INSTALLER="$(find "$APP/Contents/MacOS" \
-            -maxdepth 1 \
-            -type f \
-            -perm -111 \
-            -print -quit)"
+          if not apps:
+              raise SystemExit("ERROR: Vulkan installer app not found")
 
-          if [ -z "$INSTALLER" ]; then
-            echo "ERROR: Vulkan installer executable not found"
-            exit 1
-          fi
+          print(apps[0])
+          PY
+          )"
 
+          INSTALLER="$(python3 - "$APP" <<'PY'
+          import sys
+          from pathlib import Path
+
+          app = Path(sys.argv[1])
+          macos = app / "Contents" / "MacOS"
+          expected = macos / app.stem
+
+          if expected.is_file():
+              print(expected)
+          else:
+              files = sorted(p for p in macos.iterdir() if p.is_file())
+
+              if len(files) != 1:
+                  raise SystemExit(
+                      "ERROR: Could not identify Vulkan installer executable"
+                  )
+
+              print(files[0])
+          PY
+          )"
+
+          test -f "$INSTALLER"
           chmod +x "$INSTALLER"
 
           "$INSTALLER" \
@@ -103,41 +164,41 @@ jobs:
           echo "VULKAN_SDK=$VULKAN_SDK" >> "$GITHUB_ENV"
           echo "$VULKAN_SDK/bin" >> "$GITHUB_PATH"
 
-          echo "Vulkan SDK ready: $VULKAN_SDK"
+          echo "Vulkan SDK installed:"
+          echo "$VULKAN_SDK"
 
-      # 4. Rust toolchain
+      # 5. Install the exact Rust toolchain from rust-toolchain.toml
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-08-21
-          components: rust-src
+          components: rust-src,clippy,rustfmt,rust-analyzer
           targets: aarch64-apple-ios,aarch64-apple-ios-sim
 
-      # 5. Enable static shaderc linking
-      - name: Configure shaderc
+      # 6. Make shaderc prefer the static library.
+      # This avoids linking against shaderc_shared.dylib at runtime.
+      - name: Configure static shaderc linking
         shell: bash
         run: |
           set -euo pipefail
 
           python3 - <<'PY'
           from pathlib import Path
-          import re
 
           path = Path("pomme-client/Cargo.toml")
           content = path.read_text()
 
-          old = r'(?m)^shaderc\s*=\s*"0\.10"\s*$'
+          old = 'shaderc = "0.10"'
           new = 'shaderc = { version = "0.10", features = ["prefer-static-linking"] }'
 
           if new in content:
-              print("Static shaderc linking already enabled")
-          elif len(re.findall(old, content)) == 1:
-              content = re.sub(old, new, content)
-              path.write_text(content)
-              print("Enabled static shaderc linking")
+              print("Static shaderc linking already configured")
+          elif content.count(old) == 1:
+              path.write_text(content.replace(old, new))
+              print("Static shaderc linking enabled")
           else:
               raise SystemExit(
-                  "ERROR: Expected shaderc = \"0.10\" exactly once in pomme-client/Cargo.toml"
+                  'ERROR: Expected shaderc = "0.10" exactly once'
               )
           PY
 
@@ -145,14 +206,14 @@ jobs:
 
           SHADERC_LIB="$VULKAN_SDK/lib/libshaderc_combined.a"
 
-          test -f "$SHADERC_LIB"
+          test -s "$SHADERC_LIB"
 
-          # lipo syntax: input file first, then operation
+          echo "Checking shaderc architecture..."
           lipo "$SHADERC_LIB" -verify_arch x86_64
 
           echo "Static shaderc library verified"
 
-      # 6. Verify Rust and SDK
+      # 7. Verify the build environment
       - name: Verify build environment
         shell: bash
         run: |
@@ -164,25 +225,45 @@ jobs:
           echo "Installed Rust targets:"
           rustup target list --installed
 
+          rustup target list --installed | grep -Fx "aarch64-apple-ios"
+          rustup target list --installed | grep -Fx "aarch64-apple-ios-sim"
+
           test -f "$VULKAN_SDK/share/vulkan/registry/vk.xml"
-          test -f "$VULKAN_SDK/lib/libshaderc_combined.a"
+          test -s "$VULKAN_SDK/lib/libshaderc_combined.a"
 
           echo "Build environment verified"
 
-      # 7. Generate Xcode project
+      # 8. Generate the Xcode project
       - name: Generate Xcode project
         working-directory: pomme-ios
         shell: bash
         run: |
           set -euo pipefail
 
-          xcodegen generate --quiet
+          xcodegen generate
 
           test -d Pomme.xcodeproj
 
           xcodebuild -list -project Pomme.xcodeproj
 
-      # 8. Build the actual iOS application
+      # 9. Download and verify MoltenVK before Xcode starts.
+      # The stdout of fetch_moltenvk.py must contain only the directory.
+      - name: Prepare MoltenVK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          MOLTENVK_DIR="$(python3 tools/fetch_moltenvk.py ios)"
+
+          test -s "$MOLTENVK_DIR/lib/libvulkan.a"
+
+          echo "MoltenVK directory:"
+          echo "$MOLTENVK_DIR"
+
+          echo "MoltenVK library:"
+          file "$MOLTENVK_DIR/lib/libvulkan.a"
+
+      # 10. Build the iOS application using the repository's original script
       - name: Build Pomme iOS
         shell: bash
         run: |
@@ -191,8 +272,8 @@ jobs:
           export VULKAN_SDK
           export PATH="$HOME/.cargo/bin:$VULKAN_SDK/bin:$PATH"
 
-          echo "Host Vulkan SDK: $VULKAN_SDK"
-          echo "Building using original pomme-ios/build-app.sh"
+          echo "Using Vulkan SDK:"
+          echo "$VULKAN_SDK"
 
           xcodebuild \
             -project pomme-ios/Pomme.xcodeproj \
@@ -200,13 +281,13 @@ jobs:
             -sdk iphoneos \
             -configuration Release \
             -destination 'generic/platform=iOS' \
-            -derivedDataPath target/ios-build \
+            -derivedDataPath "$GITHUB_WORKSPACE/target/ios-build" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             build 2>&1 | tee ios-build.log
 
-      # 9. Verify application
+      # 11. Verify the generated application
       - name: Verify Pomme.app
         shell: bash
         run: |
@@ -215,23 +296,29 @@ jobs:
           APP="target/ios-build/Build/Products/Release-iphoneos/Pomme.app"
 
           if [ ! -d "$APP" ]; then
-            echo "ERROR: Pomme.app not found"
-            find target/ios-build -name "*.app" -type d
+            echo "ERROR: Pomme.app was not generated"
+
+            find target/ios-build -name "*.app" -print || true
+
             exit 1
           fi
 
-          test -f "$APP/Pomme"
-          test -f "$APP/Info.plist"
+          test -s "$APP/Pomme"
+          test -s "$APP/Info.plist"
+          test -d "$APP/Frameworks/soft_oal.framework"
 
           plutil -lint "$APP/Info.plist"
 
-          echo "Checking executable architecture..."
+          echo "Checking iOS executable..."
           file "$APP/Pomme"
           lipo "$APP/Pomme" -verify_arch arm64
 
+          echo "Checking embedded OpenAL framework..."
+          test -s "$APP/Frameworks/soft_oal.framework/soft_oal"
+
           echo "Pomme.app verified"
 
-      # 10. Package unsigned IPA
+      # 12. Package the unsigned IPA
       - name: Create unsigned IPA
         shell: bash
         run: |
@@ -240,6 +327,7 @@ jobs:
           APP="target/ios-build/Build/Products/Release-iphoneos/Pomme.app"
 
           rm -rf Payload Pomme-unsigned.ipa
+
           mkdir -p Payload
 
           ditto "$APP" Payload/Pomme.app
@@ -247,21 +335,27 @@ jobs:
           zip -qry Pomme-unsigned.ipa Payload
 
           test -s Pomme-unsigned.ipa
+
+          echo "Testing IPA archive..."
           unzip -t Pomme-unsigned.ipa
 
-          echo "IPA successfully created"
+          echo "Checking IPA structure..."
+          unzip -Z1 Pomme-unsigned.ipa | grep -Fx "Payload/Pomme.app/Info.plist"
+          unzip -Z1 Pomme-unsigned.ipa | grep -Fx "Payload/Pomme.app/Pomme"
+
+          echo "IPA successfully created:"
           ls -lh Pomme-unsigned.ipa
 
-      # 11. Upload IPA
-      - name: Upload Pomme-iOS
+      # 13. Upload the IPA
+      - name: Upload Pomme iOS IPA
         uses: actions/upload-artifact@v4
         with:
-          name: Pomme-iOS
+          name: Pomme-iOS-unsigned
           path: Pomme-unsigned.ipa
           if-no-files-found: error
           retention-days: 7
 
-      # 12. Save logs if build fails
+      # 14. Upload diagnostic logs if anything fails
       - name: Upload build logs
         if: failure()
         uses: actions/upload-artifact@v4
@@ -270,5 +364,7 @@ jobs:
           path: |
             ios-build.log
             target/ios-build/Logs/
+            target/openal-soft/
+            target/moltenvk/
           if-no-files-found: ignore
           retention-days: 7
