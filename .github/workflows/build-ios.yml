@@ -13,9 +13,14 @@ jobs:
   build-ios:
     name: Build Pomme iOS
     runs-on: macos-15-intel
-    timeout-minutes: 120
+    timeout-minutes: 180
+
+    env:
+      RUSTUP_TOOLCHAIN: nightly-2026-08-21
+      RUST_BACKTRACE: full
 
     steps:
+      # 1. Download source
       - name: Checkout Pomme
         uses: actions/checkout@v4
         with:
@@ -24,29 +29,51 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
+      # 2. Install dependencies
       - name: Install dependencies
         run: |
           brew install xcodegen cmake
+          python3 --version
+          xcodebuild -version
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      # 3. Install the EXACT Rust toolchain
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-08-21
+          components: rust-src
           targets: aarch64-apple-ios,aarch64-apple-ios-sim
 
-      - name: Ensure Rust targets
+      # 4. Verify Rust installation
+      - name: Verify Rust
         run: |
-          rustup target add aarch64-apple-ios
-          rustup target add aarch64-apple-ios-sim
-          rustup target list --installed
+          rustup show
           rustc --version
           cargo --version
+          rustup target list --installed
 
+          rustc --print target-libdir --target aarch64-apple-ios
+          test -d "$(rustc --print target-libdir --target aarch64-apple-ios)"
+
+      # 5. Generate Xcode project
       - name: Generate Xcode project
+        working-directory: pomme-ios
         run: |
-          xcodegen generate --spec pomme-ios/project.yml
+          xcodegen generate --quiet
+          test -d Pomme.xcodeproj
 
-      - name: Build unsigned iOS app
+      # 6. Check build scripts
+      - name: Verify build scripts
         run: |
+          test -f pomme-ios/build-app.sh
+          test -f tools/fetch_moltenvk.py
+          test -f tools/build_openal.py
+
+      # 7. Build for real iOS devices
+      - name: Build Pomme iOS
+        run: |
+          set -o pipefail
+
           xcodebuild \
             -project pomme-ios/Pomme.xcodeproj \
             -scheme Pomme \
@@ -57,31 +84,56 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
-            build
+            build 2>&1 | tee ios-build.log
 
-      - name: Locate app bundle
-        run: |
-          find target/ios-build -name "*.app" -type d
-
-      - name: Package unsigned IPA
+      # 8. Verify application
+      - name: Verify app bundle
         run: |
           APP="target/ios-build/Build/Products/Release-iphoneos/Pomme.app"
 
           if [ ! -d "$APP" ]; then
-            echo "ERROR: Pomme.app not found!"
+            echo "ERROR: Pomme.app was not generated!"
             find target/ios-build -name "*.app" -type d
             exit 1
           fi
 
+          test -f "$APP/Pomme"
+          file "$APP/Pomme"
+
+      # 9. Create unsigned IPA
+      - name: Package unsigned IPA
+        run: |
+          set -e
+
+          APP="target/ios-build/Build/Products/Release-iphoneos/Pomme.app"
+
+          rm -rf Payload Pomme-unsigned.ipa
           mkdir -p Payload
+
           cp -R "$APP" Payload/Pomme.app
 
-          zip -r Pomme-unsigned.ipa Payload
+          /usr/bin/zip -qry Pomme-unsigned.ipa Payload
 
-      - name: Upload IPA
+          test -s Pomme-unsigned.ipa
+          unzip -l Pomme-unsigned.ipa
+
+      # 10. Upload IPA
+      - name: Upload Pomme-iOS
         uses: actions/upload-artifact@v4
         with:
           name: Pomme-iOS
           path: Pomme-unsigned.ipa
           if-no-files-found: error
+          retention-days: 7
+
+      # 11. Upload logs if build fails
+      - name: Upload build logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Pomme-iOS-Build-Logs
+          path: |
+            ios-build.log
+            target/ios-build/Logs/
+          if-no-files-found: ignore
           retention-days: 7
