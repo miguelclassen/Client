@@ -18,9 +18,10 @@ jobs:
     env:
       RUSTUP_TOOLCHAIN: nightly-2026-08-21
       RUST_BACKTRACE: full
+      CARGO_PROFILE_RELEASE_BUILD_OVERRIDE_DEBUG: "true"
 
     steps:
-      # 1. Checkout
+      # 1. Download source
       - name: Checkout Pomme
         uses: actions/checkout@v4
         with:
@@ -32,18 +33,19 @@ jobs:
       # 2. Install dependencies
       - name: Install dependencies
         run: |
-          brew install xcodegen cmake
+          brew install xcodegen cmake ninja
           python3 --version
+          cmake --version
           xcodebuild -version
 
-      # 3. Download and install Vulkan SDK
+      # 3. Install Vulkan SDK
       - name: Install Vulkan SDK
         shell: bash
         run: |
           set -euo pipefail
 
           VERSION="1.4.363.0"
-          DOWNLOAD="$RUNNER_TEMP/vulkan-download"
+          DOWNLOAD="$RUNNER_TEMP/vulkan"
           SDK_ROOT="$RUNNER_TEMP/VulkanSDK/$VERSION"
 
           mkdir -p "$DOWNLOAD" "$SDK_ROOT"
@@ -54,14 +56,21 @@ jobs:
 
           unzip -q "$DOWNLOAD/vulkan.zip" -d "$DOWNLOAD"
 
-          INSTALLER=$(find "$DOWNLOAD" \
-            -type f \
-            -path "*/Contents/MacOS/vulkansdk-macOS-${VERSION}" \
+          APP=$(find "$DOWNLOAD" \
+            -maxdepth 4 -type d -name "*.app" \
+            -print -quit)
+
+          if [ -z "$APP" ]; then
+            echo "ERROR: Vulkan installer app missing"
+            exit 1
+          fi
+
+          INSTALLER=$(find "$APP/Contents/MacOS" \
+            -maxdepth 1 -type f -perm -111 \
             -print -quit)
 
           if [ -z "$INSTALLER" ]; then
-            echo "Vulkan installer executable not found"
-            find "$DOWNLOAD" -maxdepth 5
+            echo "ERROR: Vulkan installer executable missing"
             exit 1
           fi
 
@@ -77,16 +86,14 @@ jobs:
           VULKAN_SDK="$SDK_ROOT/macOS"
 
           if [ ! -f "$VULKAN_SDK/share/vulkan/registry/vk.xml" ]; then
-            echo "ERROR: Vulkan vk.xml missing"
+            echo "ERROR: vk.xml missing"
             find "$SDK_ROOT" -name vk.xml
             exit 1
           fi
 
-          if ! find "$VULKAN_SDK/lib" -maxdepth 1 -type f \
-            \( -name "libshaderc_combined.a" \
-            -o -name "libshaderc_shared.dylib" \
-            -o -name "libshaderc.dylib" \) | grep -q .; then
-            echo "ERROR: Native shaderc library missing"
+          if ! find "$VULKAN_SDK/lib" -maxdepth 1 \
+            -type f -name "libshaderc*" | grep -q .; then
+            echo "ERROR: shaderc library missing"
             ls -la "$VULKAN_SDK/lib"
             exit 1
           fi
@@ -94,9 +101,9 @@ jobs:
           echo "VULKAN_SDK=$VULKAN_SDK" >> "$GITHUB_ENV"
           echo "$VULKAN_SDK/bin" >> "$GITHUB_PATH"
 
-          echo "Vulkan SDK successfully installed"
+          echo "Vulkan SDK installed successfully"
 
-      # 4. Install Rust
+      # 4. Install exact Rust toolchain
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:
@@ -106,25 +113,34 @@ jobs:
 
       # 5. Verify environment
       - name: Verify environment
+        shell: bash
         run: |
           set -euo pipefail
 
           rustc --version
           cargo --version
-          rustup target list --installed
 
-          echo "VULKAN_SDK=$VULKAN_SDK"
+          rustup target list --installed
 
           test -f "$VULKAN_SDK/share/vulkan/registry/vk.xml"
           test -d "$VULKAN_SDK/lib"
-          test -d "$VULKAN_SDK/include"
+
+          echo "VULKAN_SDK=$VULKAN_SDK"
+
+          rustc --print target-libdir \
+            --target aarch64-apple-ios
 
       # 6. Generate Xcode project
       - name: Generate Xcode project
         working-directory: pomme-ios
         run: |
+          set -euo pipefail
+
           xcodegen generate --quiet
+
           test -d Pomme.xcodeproj
+
+          xcodebuild -list -project Pomme.xcodeproj
 
       # 7. Build unsigned iOS application
       - name: Build Pomme iOS
@@ -132,10 +148,10 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "Using Vulkan SDK: $VULKAN_SDK"
-
           export VULKAN_SDK
           export PATH="$HOME/.cargo/bin:$VULKAN_SDK/bin:$PATH"
+
+          echo "Using Vulkan SDK: $VULKAN_SDK"
 
           xcodebuild \
             -project pomme-ios/Pomme.xcodeproj \
@@ -149,15 +165,16 @@ jobs:
             CODE_SIGN_IDENTITY="" \
             build 2>&1 | tee ios-build.log
 
-      # 8. Verify application
+      # 8. Verify app
       - name: Verify Pomme.app
+        shell: bash
         run: |
           set -euo pipefail
 
           APP="target/ios-build/Build/Products/Release-iphoneos/Pomme.app"
 
           if [ ! -d "$APP" ]; then
-            echo "Pomme.app missing!"
+            echo "ERROR: Pomme.app not found"
             find target/ios-build -name "*.app" -type d
             exit 1
           fi
@@ -166,10 +183,12 @@ jobs:
           test -f "$APP/Info.plist"
 
           plutil -lint "$APP/Info.plist"
-          file "$APP/Pomme"
 
-      # 9. Create unsigned IPA
-      - name: Package IPA
+          echo "Application verified"
+
+      # 9. Create IPA
+      - name: Package unsigned IPA
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -185,7 +204,7 @@ jobs:
           test -s Pomme-unsigned.ipa
           unzip -t Pomme-unsigned.ipa
 
-          echo "IPA created successfully"
+          echo "IPA successfully created"
           ls -lh Pomme-unsigned.ipa
 
       # 10. Upload IPA
@@ -197,7 +216,7 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      # 11. Upload diagnostics
+      # 11. Upload logs on failure
       - name: Upload build logs
         if: failure()
         uses: actions/upload-artifact@v4
